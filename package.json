@@ -1,0 +1,105 @@
+{
+  "name": "copilot-retry-proxy",
+  "displayName": "Copilot Retry Proxy",
+  "description": "本地重试代理，自动重试第三方 API 的限流错误（11210 / 429 / 5xx）",
+  "version": "0.0.2",
+  "publisher": "ITAS6666",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lizehui2025/copilot-retry-extension.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilotRetryProxy.start",
+        "title": "Copilot Retry Proxy: 启动代理"
+      },
+      {
+        "command": "copilotRetryProxy.stop",
+        "title": "Copilot Retry Proxy: 停止代理"
+      },
+      {
+        "command": "copilotRetryProxy.restart",
+        "title": "Copilot Retry Proxy: 重启代理"
+      },
+      {
+        "command": "copilotRetryProxy.showStatus",
+        "title": "Copilot Retry Proxy: 查看状态"
+      },
+      {
+        "command": "copilotRetryProxy.showLog",
+        "title": "Copilot Retry Proxy: 查看日志"
+      },
+      {
+        "command": "copilotRetryProxy.openConfig",
+        "title": "Copilot Retry Proxy: 打开上游配置文件"
+      }
+    ],
+    "configuration": {
+      "title": "Copilot Retry Proxy",
+      "properties": {
+        "copilotRetryProxy.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否在 VS Code 启动时自动启动代理"
+        },
+        "copilotRetryProxy.port": {
+          "type": "number",
+          "default": 8787,
+          "description": "代理监听端口"
+        },
+        "copilotRetryProxy.maxRetries": {
+          "type": "number",
+          "default": 5,
+          "description": "最大重试次数"
+        },
+        "copilotRetryProxy.initialBackoffMs": {
+          "type": "number",
+          "default": 1000,
+          "description": "初始退避时间（毫秒）"
+        },
+        "copilotRetryProxy.backoffMultiplier": {
+          "type": "number",
+          "default": 2,
+          "description": "退避倍数"
+        },
+        "copilotRetryProxy.maxBackoffMs": {
+          "type": "number",
+          "default": 30000,
+          "description": "最大退避时间（毫秒）"
+        },
+        "copilotRetryProxy.upstreams": {
+          "type": "object",
+          "default": {},
+          "description": "上游映射：路径前缀 → 上游 baseURL。留空则自动从 upstreams.json 读取",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^2.32.0",
+    "typescript": "^5.4.0"
+  }
+}

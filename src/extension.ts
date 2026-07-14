@@ -3,13 +3,19 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { RetryProxy, ProxyConfig } from './proxy';
+import {
+  ChatLanguageModelEntry,
+  hostnameToPrefix,
+  isProxyUrl,
+  proxyPrefixFromUrl,
+  recoverUpstreamsFromLocalData,
+} from './upstreamDiscovery';
 
 let proxy: RetryProxy | null = null;
 let statusBarItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
 let globalStoragePath: string;
 let chatModelsPath: string | undefined;
-let fileWatcher: vscode.FileSystemWatcher | null = null;
 
 function getUpstreamsConfigPath(): string {
   return path.join(globalStoragePath, 'upstreams.json');
@@ -51,31 +57,11 @@ function getChatLanguageModelsPath(): string | undefined {
   return undefined;
 }
 
-interface ChatLanguageModelEntry {
-  name?: string;
-  models?: Array<{ url?: string }>;
-}
-
-function hostnameToPrefix(hostname: string): string {
-  const parts = hostname.split('.');
-  const meaningful = parts.length >= 2 ? parts[parts.length - 2] : parts[0];
-  return '/' + meaningful.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function isProxyUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
-  } catch {
-    return false;
-  }
-}
-
 let isRewriting = false;
 
 function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten: boolean } {
   if (isRewriting) {
-    return { upstreams: {}, rewritten: false };
+    return { upstreams: loadUpstreamsFromFile(), rewritten: false };
   }
   const result: Record<string, string> = loadUpstreamsFromFile();
   if (!chatModelsPath || !fs.existsSync(chatModelsPath)) {
@@ -103,6 +89,17 @@ function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten
     return { upstreams: result, rewritten: false };
   }
   const entries = parsed as ChatLanguageModelEntry[];
+  const recovered = recoverUpstreamsFromLocalData(chatModelsPath, entries, result);
+  for (const [prefix, base] of Object.entries(recovered.upstreams)) {
+    if (!result[prefix]) {
+      result[prefix] = base;
+    }
+  }
+  if (recovered.sources.length > 0) {
+    outputChannel.appendLine(
+      `[${new Date().toISOString()}] [INFO] 已自动恢复上游映射: ${Object.keys(recovered.upstreams).join(', ')}（来源: ${recovered.sources.join(', ')}）`
+    );
+  }
   let rewritten = false;
   for (const entry of entries) {
     if (!entry.models || !Array.isArray(entry.models)) {
@@ -113,12 +110,8 @@ function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten
         continue;
       }
       if (isProxyUrl(model.url)) {
-        try {
-          const proxyUrl = new URL(model.url);
-          const prefix = '/' + (proxyUrl.pathname.match(/^\/([^/]+)/) || [])[1];
-          if (prefix && result[prefix] === undefined) continue;
-        } catch {
-        }
+        const prefix = proxyPrefixFromUrl(model.url);
+        if (prefix && result[prefix] === undefined) continue;
         continue;
       }
       try {
@@ -142,9 +135,18 @@ function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten
     }
   }
 
-  saveUpstreamsToFile(finalUpstreams);
+  // Never replace persistent routing with an empty object. A publisher/ID
+  // migration or a temporarily unavailable model file must remain recoverable.
+  const mappingPersisted =
+    Object.keys(finalUpstreams).length > 0 && saveUpstreamsToFile(finalUpstreams);
 
   if (rewritten) {
+    if (!mappingPersisted) {
+      outputChannel.appendLine(
+        `[${new Date().toISOString()}] [ERROR] 上游映射未能安全落盘，已取消改写 chatLanguageModels.json`
+      );
+      return { upstreams: finalUpstreams, rewritten: false };
+    }
     try {
       isRewriting = true;
       const backupPath = chatModelsPath + '.bak';
@@ -164,13 +166,38 @@ function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten
   return { upstreams: finalUpstreams, rewritten };
 }
 
-function saveUpstreamsToFile(upstreams: Record<string, string>): void {
+function saveUpstreamsToFile(upstreams: Record<string, string>): boolean {
+  const configPath = getUpstreamsConfigPath();
+  const tempPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(getUpstreamsConfigPath(), JSON.stringify(upstreams, null, 2), 'utf8');
+    const merged: Record<string, string> = {};
+    if (fs.existsSync(configPath)) {
+      const existing: unknown = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
+        throw new Error('现有 upstreams.json 不是有效对象，拒绝覆盖');
+      }
+      for (const [prefix, base] of Object.entries(existing)) {
+        if (typeof base === 'string' && base.trim()) {
+          merged[prefix] = base;
+        }
+      }
+    }
+    Object.assign(merged, upstreams);
+    fs.writeFileSync(tempPath, JSON.stringify(merged, null, 2), 'utf8');
+    fs.renameSync(tempPath, configPath);
+    return true;
   } catch (err) {
+    try {
+      if (fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+      }
+    } catch {
+      // Ignore cleanup failures; the uniquely named temp file is harmless.
+    }
     outputChannel.appendLine(
       `[${new Date().toISOString()}] [ERROR] 写入 upstreams.json 失败: ${(err as Error).message}`
     );
+    return false;
   }
 }
 
@@ -338,6 +365,17 @@ function showLog(): void {
   }
 }
 
+async function openConfig(): Promise<void> {
+  const configPath = getUpstreamsConfigPath();
+  if (!fs.existsSync(configPath)) {
+    const empty = '{}';
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, empty, 'utf8');
+  }
+  const doc = await vscode.workspace.openTextDocument(configPath);
+  await vscode.window.showTextDocument(doc);
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel('Copilot Retry Proxy');
   context.subscriptions.push(outputChannel);
@@ -365,7 +403,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('copilotRetryProxy.stop', stopProxy),
     vscode.commands.registerCommand('copilotRetryProxy.restart', restartProxy),
     vscode.commands.registerCommand('copilotRetryProxy.showStatus', showStatus),
-    vscode.commands.registerCommand('copilotRetryProxy.showLog', showLog)
+    vscode.commands.registerCommand('copilotRetryProxy.showLog', showLog),
+    vscode.commands.registerCommand('copilotRetryProxy.openConfig', openConfig)
   );
 
   context.subscriptions.push(
@@ -388,13 +427,15 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       debounceTimer = setTimeout(() => {
         log('info', '检测到 chatLanguageModels.json 变更，重新加载上游映射...');
-        if (proxy && proxy.isRunning()) {
+        const enabled = vscode.workspace
+          .getConfiguration('copilotRetryProxy')
+          .get<boolean>('enabled', true);
+        if ((proxy && proxy.isRunning()) || enabled) {
           restartProxy();
         }
       }, 1000);
     });
     context.subscriptions.push(watcher);
-    fileWatcher = watcher;
   }
 
   statusBarItem.show();

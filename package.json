@@ -2,7 +2,7 @@
   "name": "copilot-retry-proxy",
   "displayName": "Copilot Retry Proxy",
   "description": "本地重试代理，自动重试第三方 API 的限流错误（11210 / 429 / 5xx）",
-  "version": "0.0.2",
+  "version": "0.0.5",
   "publisher": "ITAS6666",
   "license": "MIT",
   "repository": {
@@ -94,6 +94,8 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test test/*.test.js",
+    "lint": "tsc -p ./ --noEmit",
     "package": "npx @vscode/vsce package --no-dependencies"
   },
   "devDependencies": {

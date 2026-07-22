@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.0.7] - 2026-07-15
+
+### Fixed
+- 兼容 Copilot 将多工具响应拆分为多个 assistant 消息的情况：工具调用 ID 会忽略 `__vscode-*` 执行后缀，并允许用原响应工具集合的子集安全匹配思考内容。
+- 当 Copilot 仅保留 `reasoning` 时，自动提升为上游要求的 `reasoning_content`；`cot_summary` 作为兼容性兜底。
+
+### Added
+- 为每次思考模式请求记录 assistant 总数、原缺失数、缓存回填数及仍未解决的工具消息数，不记录消息正文或思考内容。
+
+## [0.0.6] - 2026-07-15
+
+### Fixed
+- 修复 DeepSeek 思考模式只输出 `reasoning_content`（`content` 为空字符串、无 `tool_calls`）的响应被 `ReasoningBridge.record()` 误丢弃的问题。之前这类响应因 `(!content && !toolCalls)` 过滤条件被忽略，导致下一轮请求未能回填 `reasoning_content`，上游 API 返回 400 `10305`（"The reasoning_content in the thinking mode must be passed back to the API."）。
+
 ## [0.0.5] - 2026-07-14
 
 ### Added

@@ -195,6 +195,7 @@ test('injects captured reasoning before the next proxied tool request', async ()
       secondUpstreamBody.messages[1].reasoning_content,
       'hidden-plan'
     );
+    assert.equal(secondUpstreamBody.messages[1].reasoning, undefined);
   } finally {
     await proxy.stop();
     await close(upstream);

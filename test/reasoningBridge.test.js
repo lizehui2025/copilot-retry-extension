@@ -194,3 +194,243 @@ test('does not cache incomplete streams and expires cached reasoning', () => {
   now += 101;
   assert.equal(bridge.size, 0);
 });
+
+test('caches reasoningContent-only responses with empty content', () => {
+  // 回归: DeepSeek 思考模式有时只输出 reasoning_content，content 为空字符串。
+  // 之前 record 会因为 (!content && !toolCalls) 丢弃响应，导致下一轮请求
+  // 缺失 reasoning_content，上游返回 10305。
+  const bridge = new ReasoningBridge();
+  const input = [{ role: 'user', content: '算 1+1' }];
+  const prepared = bridge.prepareRequest(request(input), scope);
+  const observer = bridge.observeStream(contextFor(prepared));
+  observer.push(
+    Buffer.from(
+      'data: {"choices":[{"index":0,"delta":{"reasoning_content":"1+1=2"}}]}\n\n'
+    )
+  );
+  observer.push(
+    Buffer.from(
+      'data: {"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}\n\n'
+    )
+  );
+  observer.finish();
+  assert.equal(bridge.size, 1);
+
+  const followup = bridge.prepareRequest(
+    request([
+      ...input,
+      { role: 'assistant', content: '' },
+      { role: 'user', content: '再算 2+2' },
+    ]),
+    scope
+  );
+  assert.equal(followup.injectedCount, 1);
+  const parsed = JSON.parse(followup.body.toString('utf8'));
+  assert.equal(parsed.messages[1].reasoning_content, '1+1=2');
+  assert.equal(parsed.messages[1].reasoning, undefined);
+});
+
+test('promotes Copilot reasoning aliases to reasoning_content', () => {
+  const bridge = new ReasoningBridge();
+  const prepared = bridge.prepareRequest(
+    request([
+      { role: 'user', content: 'one' },
+      { role: 'assistant', content: null, reasoning: 'kept-thinking' },
+      { role: 'user', content: 'two' },
+    ]),
+    scope
+  );
+  const parsed = JSON.parse(prepared.body.toString('utf8'));
+  assert.equal(prepared.assistantCount, 1);
+  assert.equal(prepared.missingReasoningCount, 1);
+  assert.equal(prepared.promotedAliasCount, 1);
+  assert.equal(prepared.unresolvedCount, 0);
+  assert.equal(parsed.messages[1].reasoning_content, 'kept-thinking');
+  assert.equal(parsed.messages[1].reasoning, 'kept-thinking');
+});
+
+test('uses Copilot cot_summary as a best-effort reasoning fallback', () => {
+  const bridge = new ReasoningBridge();
+  const prepared = bridge.prepareRequest(
+    request([
+      { role: 'user', content: 'one' },
+      { role: 'assistant', content: null, cot_summary: 'stored-thinking' },
+      { role: 'user', content: 'two' },
+    ]),
+    scope
+  );
+  const parsed = JSON.parse(prepared.body.toString('utf8'));
+  assert.equal(prepared.missingReasoningCount, 1);
+  assert.equal(prepared.promotedAliasCount, 1);
+  assert.equal(prepared.unresolvedCount, 0);
+  assert.equal(parsed.messages[1].reasoning_content, 'stored-thinking');
+  assert.equal(parsed.messages[1].cot_summary, 'stored-thinking');
+});
+
+test('matches split tool messages with VS Code id suffixes', () => {
+  const bridge = new ReasoningBridge();
+  const input = [{ role: 'user', content: 'use two tools' }];
+  const prepared = bridge.prepareRequest(request(input), scope);
+  assert.equal(
+    bridge.captureJsonResponse(
+      Buffer.from(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                reasoning_content: 'plan both calls',
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_a',
+                    type: 'function',
+                    function: { name: 'first', arguments: '{}' },
+                  },
+                  {
+                    id: 'call_b',
+                    type: 'function',
+                    function: { name: 'second', arguments: '{}' },
+                  },
+                ],
+              },
+            },
+          ],
+        })
+      ),
+      contextFor(prepared)
+    ),
+    true
+  );
+
+  const followup = bridge.prepareRequest(
+    request([
+      ...input,
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'call_a__vscode-1784087608982',
+            type: 'function',
+            function: { name: 'first', arguments: '{}' },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_a__vscode-1784087608982',
+        content: 'first result',
+      },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'call_b__vscode-1784087608983',
+            type: 'function',
+            function: { name: 'second', arguments: '{}' },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_b__vscode-1784087608983',
+        content: 'second result',
+      },
+    ]),
+    scope
+  );
+  const parsed = JSON.parse(followup.body.toString('utf8'));
+  assert.equal(followup.assistantCount, 2);
+  assert.equal(followup.missingReasoningCount, 2);
+  assert.equal(followup.injectedCount, 2);
+  assert.equal(followup.unresolvedCount, 0);
+  assert.equal(followup.unresolvedToolCallCount, 0);
+  assert.equal(parsed.messages[1].reasoning_content, 'plan both calls');
+  assert.equal(parsed.messages[3].reasoning_content, 'plan both calls');
+});
+
+test('reports unresolved assistant tool messages without logging content', () => {
+  const bridge = new ReasoningBridge();
+  const prepared = bridge.prepareRequest(
+    request([
+      { role: 'user', content: 'use a tool' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'unknown_call',
+            type: 'function',
+            function: { name: 'unknown', arguments: '{}' },
+          },
+        ],
+      },
+    ]),
+    scope
+  );
+  assert.equal(prepared.assistantCount, 1);
+  assert.equal(prepared.missingReasoningCount, 1);
+  assert.equal(prepared.injectedCount, 0);
+  assert.equal(prepared.unresolvedCount, 1);
+  assert.equal(prepared.unresolvedToolCallCount, 1);
+});
+
+test('does not choose between ambiguous normalized tool ids', () => {
+  const bridge = new ReasoningBridge();
+  for (const [content, reasoning] of [
+    ['first context', 'first reasoning'],
+    ['second context', 'second reasoning'],
+  ]) {
+    const prepared = bridge.prepareRequest(
+      request([{ role: 'user', content }]),
+      scope
+    );
+    assert.equal(
+      bridge.captureJsonResponse(
+        Buffer.from(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  reasoning_content: reasoning,
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: 'same_call',
+                      type: 'function',
+                      function: { name: 'same', arguments: '{}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          })
+        ),
+        contextFor(prepared)
+      ),
+      true
+    );
+  }
+
+  const followup = bridge.prepareRequest(
+    request([
+      { role: 'user', content: 'unrelated context' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'same_call__vscode-1784087608999',
+            type: 'function',
+            function: { name: 'same', arguments: '{}' },
+          },
+        ],
+      },
+    ]),
+    scope
+  );
+  assert.equal(followup.injectedCount, 0);
+  assert.equal(followup.unresolvedCount, 1);
+  assert.equal(followup.unresolvedToolCallCount, 1);
+});

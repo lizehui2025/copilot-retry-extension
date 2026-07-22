@@ -1,9 +1,42 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+export type ApiType = 'chat-completions';
+
+export type ReasoningEffort = 'low' | 'medium' | 'high';
+
+export type ReasoningEffortFormat = 'chat-completions';
+
+export interface ChatModelSettings {
+  reasoningEffort?: ReasoningEffort;
+  [key: string]: unknown;
+}
+
+export interface ChatModelDefinition {
+  id?: string;
+  name?: string;
+  url?: string;
+  stream?: boolean;
+  toolCalling?: boolean;
+  vision?: boolean;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  contextWindow?: number;
+  thinking?: boolean;
+  supportsReasoningEffort?: ReasoningEffort[];
+  reasoningEffortFormat?: ReasoningEffortFormat;
+  [key: string]: unknown;
+}
+
 export interface ChatLanguageModelEntry {
   name?: string;
-  models?: Array<{ url?: string }>;
+  vendor?: string;
+  apiType?: ApiType;
+  apiKey?: string;
+  models?: ChatModelDefinition[];
+  stream?: boolean;
+  settings?: Record<string, ChatModelSettings>;
+  [key: string]: unknown;
 }
 
 export interface RecoveryResult {

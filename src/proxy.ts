@@ -6,6 +6,9 @@ import {
   PreparedChatRequest,
   ReasoningBridge,
   ResponseContext,
+  ensureStreamUsageOptions,
+  estimateUsage,
+  formatUsageSseFrame,
 } from './reasoningBridge';
 
 export interface ProxyConfig {
@@ -136,7 +139,6 @@ function reasoningScope(
     .digest('hex');
 }
 
-// Agent 连接池管理器（HTTP keep-alive）
 class AgentManager {
   private agents = new Map<string, http.Agent | https.Agent>();
 
@@ -173,8 +175,6 @@ const agentManager = new AgentManager();
 
 function filterSignatureHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string | string[] | undefined> {
   const filtered = { ...headers };
-  // 移除可能导致 HMAC 签名验证失败的请求头
-  // 这些头通常包含时间戳、请求ID等，重试时会导致签名不匹配
   const signatureHeaders = [
     'x-request-id',
     'x-correlation-id', 
@@ -259,6 +259,76 @@ function collectResponse(res: http.IncomingMessage): Promise<Buffer> {
   });
 }
 
+/**
+ * 轻量 SSE usage 嗅探器：扫描每个上游到达的 chunk 是否包含带 usage 的 data 帧。
+ * 仅检测缓冲区是否出现 `"usage":{"prompt_tokens"`，避免对每个 chunk 都 JSON.parse。
+ */
+class StreamUsageDetector {
+  private pending = '';
+  private sawUsage = false;
+
+  push(chunk: Buffer): void {
+    if (this.sawUsage) return;
+    const tail =
+      this.pending.length > 1024 ? this.pending.slice(-1024) : this.pending;
+    this.pending = tail + chunk.toString('utf8');
+    if (
+      this.pending.includes('"usage"') &&
+      this.pending.includes('"prompt_tokens"')
+    ) {
+      this.sawUsage = true;
+      this.pending = '';
+    } else if (this.pending.length > 64 * 1024) {
+      this.pending = this.pending.slice(-1024);
+    }
+  }
+
+  hasUsage(): boolean {
+    return this.sawUsage;
+  }
+}
+
+function ensureJsonResponseUsage(
+  body: Buffer,
+  requestMessages: unknown,
+  model?: string
+): Buffer {
+  if (body.length === 0 || body.length > 16 * 1024 * 1024) {
+    return body;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString('utf8'));
+  } catch {
+    return body;
+  }
+  if (!parsed || typeof parsed !== 'object') return body;
+  const record = parsed as Record<string, unknown>;
+  if (!record.choices || !Array.isArray(record.choices)) return body;
+  if (record.usage && typeof record.usage === 'object') return body;
+
+  let assistantContent = '';
+  const firstChoice = record.choices[0];
+  if (firstChoice && typeof firstChoice === 'object') {
+    const msg = (firstChoice as Record<string, unknown>).message;
+    if (msg && typeof msg === 'object') {
+      const c = (msg as Record<string, unknown>).content;
+      assistantContent = typeof c === 'string' ? c : '';
+    }
+  }
+  const usage = estimateUsage(
+    Array.isArray(requestMessages)
+      ? (requestMessages as import('./reasoningBridge').ChatMessage[])
+      : undefined,
+    assistantContent
+  );
+  if (model && typeof model === 'string') {
+    record.model = model;
+  }
+  record.usage = usage;
+  return Buffer.from(JSON.stringify(record), 'utf8');
+}
+
 function responseHeaders(
   headers: http.IncomingHttpHeaders
 ): Record<string, string | string[] | undefined> {
@@ -291,12 +361,9 @@ function isFirstFrameStreamError(firstChunk: Buffer): boolean {
       const parsed: unknown = JSON.parse(data);
       if (!parsed || typeof parsed !== 'object') continue;
       const record = parsed as Record<string, unknown>;
-      // Only structured error envelopes count. Never inspect normal content or
-      // reasoning text, which may legitimately discuss rate limits/errors.
       if (record.error) return true;
       if (record.type === 'error' && record.message) return true;
     } catch {
-      // An incomplete first SSE event is not enough evidence to retry.
     }
   }
   return false;
@@ -422,20 +489,38 @@ async function handleRequest(
     targetUrl,
     rawHeaders
   );
+  let requestForReasoning: Buffer = reqBody;
+  let requestMessages: import('./reasoningBridge').ChatMessage[] | undefined;
+  if (reasoningEligible) {
+    const usageOptions = ensureStreamUsageOptions(reqBody);
+    requestForReasoning = usageOptions.body;
+    requestMessages = usageOptions.requestMessages;
+    if (usageOptions.modified) {
+      log(
+        'info',
+        '[usage] 已注入 stream_options.include_usage=true,上游将在流末尾发送 usage 帧'
+      );
+    }
+  }
+
   let preparedRequest: PreparedChatRequest = {
-    body: reqBody,
+    body: requestForReasoning,
     injectedCount: 0,
+    promotedAliasCount: 0,
+    assistantCount: 0,
+    missingReasoningCount: 0,
+    unresolvedCount: 0,
+    unresolvedToolCallCount: 0,
   };
   let responseContext: ResponseContext | undefined;
   if (reasoningEligible && !isSignedRequest(rawHeaders)) {
     const scope = reasoningScope(targetUrl, rawHeaders);
-    preparedRequest = reasoningBridge.prepareRequest(reqBody, scope);
+    preparedRequest = reasoningBridge.prepareRequest(requestForReasoning, scope);
     responseContext = {
       scope,
       model: preparedRequest.model,
       requestFingerprint: preparedRequest.requestFingerprint,
     };
-    // Make the observation tap see plain SSE/JSON while forwarding semantics stay unchanged.
     rawHeaders['accept-encoding'] = 'identity';
     if (preparedRequest.injectedCount > 0) {
       log(
@@ -443,10 +528,23 @@ async function handleRequest(
         `[reasoning] 已为 ${preparedRequest.injectedCount} 条 assistant 消息回填 reasoning_content`
       );
     }
+    if (
+      preparedRequest.missingReasoningCount > 0 ||
+      preparedRequest.promotedAliasCount > 0
+    ) {
+      log(
+        preparedRequest.unresolvedCount > 0 ? 'warn' : 'info',
+        `[reasoning] assistant=${preparedRequest.assistantCount}, ` +
+          `原缺失=${preparedRequest.missingReasoningCount}, ` +
+          `别名恢复=${preparedRequest.promotedAliasCount}, ` +
+          `缓存回填=${preparedRequest.injectedCount}, ` +
+          `仍缺失=${preparedRequest.unresolvedCount}, ` +
+          `其中工具消息=${preparedRequest.unresolvedToolCallCount}`
+      );
+    }
   } else if (reasoningEligible) {
     log('warn', '[reasoning] 请求包含内容签名，已跳过 reasoning_content 注入');
   }
-  // 第一次使用原始 headers（包含签名），重试时需要过滤签名头
   const reqHeaders = rawHeaders;
 
   let lastError: Error | null = null;
@@ -460,7 +558,6 @@ async function handleRequest(
         await sleep(delay);
       }
 
-      // 重试时过滤签名头（移除时间戳/请求ID等导致 HMAC 验证失败的头）
       const currentHeaders = attempt > 0 ? filterSignatureHeaders(rawHeaders) : reqHeaders;
 
       log('info', `${req.method} ${maskUrl(targetUrl)} (attempt ${attempt + 1})`);
@@ -491,8 +588,28 @@ async function handleRequest(
           log('info', '[reasoning] 已缓存非流式响应的思考上下文');
         }
 
-        res.writeHead(statusCode, responseHeaders(upstreamRes.headers));
-        res.end(body);
+        let outBody = body;
+        if (
+          reasoningEligible &&
+          statusCode >= 200 &&
+          statusCode < 300 &&
+          bodyText.includes('"choices"')
+        ) {
+          const before = outBody.length;
+          outBody = ensureJsonResponseUsage(
+            outBody,
+            requestMessages,
+            preparedRequest.model
+          );
+          if (outBody.length !== before) {
+            log('info', '[usage] 非流式响应缺少 usage 字段,已补全估算值');
+          }
+        }
+
+        const outHeaders = responseHeaders(upstreamRes.headers);
+        outHeaders['content-length'] = String(outBody.length);
+        res.writeHead(statusCode, outHeaders);
+        res.end(outBody);
         return;
       }
 
@@ -522,7 +639,6 @@ async function handleRequest(
           upstreamRes.destroy();
           continue;
         }
-        // 所有重试都失败，必须响应客户端，否则客户端会一直挂起
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'sniff failed', message: (err as Error).message }));
@@ -532,7 +648,6 @@ async function handleRequest(
         return;
       }
 
-      // 流式传输：首帧嗅探会 pause 上游；安装完整的事件与背压处理后再 resume。
       res.writeHead(statusCode, responseHeaders(upstreamRes.headers));
       const reasoningObserver =
         responseContext && statusCode >= 200 && statusCode < 300
@@ -547,6 +662,9 @@ async function handleRequest(
       };
       observeReasoningChunk(firstChunk);
 
+      const usageDetector = new StreamUsageDetector();
+      usageDetector.push(firstChunk);
+
       const idleTimeoutMs = 60000; // 60 秒无数据视为超时
       let idleTimer: NodeJS.Timeout | null = null;
 
@@ -560,7 +678,6 @@ async function handleRequest(
 
       resetIdleTimer();
 
-      // 等待流完成（处理 end/error/close、下游背压，并防止重复结束）。
       await new Promise<void>((resolve, reject) => {
         let done = false;
         let upstreamEnded = false;
@@ -606,6 +723,7 @@ async function handleRequest(
 
         const onData = (chunk: Buffer) => {
           observeReasoningChunk(chunk);
+          usageDetector.push(chunk);
           forwardChunk(chunk);
         };
         const onEnd = () => {
@@ -613,6 +731,28 @@ async function handleRequest(
           if (reasoningObserver?.finish() && !reasoningCacheLogged) {
             reasoningCacheLogged = true;
             log('info', '[reasoning] 已缓存流式响应的思考上下文');
+          }
+          if (
+            reasoningEligible &&
+            statusCode >= 200 &&
+            statusCode < 300 &&
+            !usageDetector.hasUsage() &&
+            !res.destroyed &&
+            res.writable
+          ) {
+            const finalContent = reasoningObserver
+              ? reasoningObserver.capturedContent()
+              : '';
+            const usage = estimateUsage(requestMessages, finalContent);
+            const frame = formatUsageSseFrame(usage, preparedRequest.model);
+            try {
+              res.write(frame);
+              log(
+                'info',
+                `[usage] 上游未回 usage,已补估算帧 prompt≈${usage.prompt_tokens} completion≈${usage.completion_tokens}`
+              );
+            } catch {
+            }
           }
           res.end();
           finish();
@@ -658,7 +798,6 @@ async function handleRequest(
     } catch (err) {
       lastError = err as Error;
       log('error', `[attempt ${attempt + 1}] 请求失败: ${(err as Error).message}`);
-      // 如果已经向客户端发送了响应头，就不能再重试了
       if (res.headersSent) {
         if (!res.destroyed) {
           res.destroy(err as Error);

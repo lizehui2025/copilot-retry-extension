@@ -11,7 +11,7 @@ interface ToolCall {
   };
 }
 
-interface ChatMessage {
+export interface ChatMessage {
   role?: string;
   content?: unknown;
   reasoning_content?: unknown;
@@ -23,10 +23,17 @@ interface ChatMessage {
   [key: string]: unknown;
 }
 
+interface ChatTokenUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
 interface CapturedAssistantResponse {
   reasoningContent: string;
   content: string;
   toolCalls: ToolCall[];
+  usage?: ChatTokenUsage;
 }
 
 interface CacheEntry extends CapturedAssistantResponse {
@@ -49,6 +56,11 @@ export interface PreparedChatRequest {
   model?: string;
   requestFingerprint?: string;
   injectedCount: number;
+  promotedAliasCount: number;
+  assistantCount: number;
+  missingReasoningCount: number;
+  unresolvedCount: number;
+  unresolvedToolCallCount: number;
 }
 
 export interface ReasoningBridgeOptions {
@@ -67,9 +79,6 @@ function canonicalize(value: unknown): unknown {
   if (value && typeof value === 'object') {
     const result: Record<string, unknown> = {};
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      if (key === 'reasoning_content') {
-        continue;
-      }
       result[key] = canonicalize((value as Record<string, unknown>)[key]);
     }
     return result;
@@ -81,6 +90,20 @@ function fingerprint(value: unknown): string {
   return createHash('sha256')
     .update(JSON.stringify(canonicalize(value)))
     .digest('hex');
+}
+
+function messagesFingerprint(messages: ChatMessage[]): string {
+  const withoutReasoning = messages.map((message) => {
+    if (!message || message.role !== 'assistant') {
+      return message;
+    }
+    const clone = { ...message };
+    delete clone.reasoning_content;
+    delete clone.reasoning;
+    delete clone.cot_summary;
+    return clone;
+  });
+  return fingerprint(withoutReasoning);
 }
 
 function contentText(content: unknown): string {
@@ -138,7 +161,30 @@ function toolCallIds(toolCalls: ToolCall[] | undefined): string[] {
   return normalizeToolCalls(toolCalls)
     .map((call) => call.id)
     .filter((id): id is string => Boolean(id))
+    .map(normalizeToolCallId)
     .sort();
+}
+
+function normalizeToolCallId(id: string): string {
+  return id.replace(/__vscode-\d+$/, '');
+}
+
+function isStringSubset(subset: string[], values: string[]): boolean {
+  return subset.length > 0 && subset.every((value) => values.includes(value));
+}
+
+function reasoningAliasText(message: ChatMessage): string {
+  for (const key of ['reasoning', 'cot_summary']) {
+    const value = message[key];
+    if (typeof value === 'string' && value.length > 0) {
+      return value;
+    }
+  }
+  return '';
+}
+
+function setReasoning(message: ChatMessage, reasoning: string): void {
+  message.reasoning_content = reasoning;
 }
 
 function messageToolCalls(message: ChatMessage): ToolCall[] {
@@ -179,12 +225,32 @@ class AssistantResponseAccumulator {
   private reasoningContent = '';
   private content = '';
   private toolCalls = new Map<number, ToolCall>();
+  private usage?: ChatTokenUsage;
 
   accept(payload: unknown): void {
     if (!payload || typeof payload !== 'object') {
       return;
     }
-    const choices = (payload as Record<string, unknown>).choices;
+    const record = payload as Record<string, unknown>;
+    if (
+      record.usage &&
+      typeof record.usage === 'object' &&
+      !Array.isArray(record.usage)
+    ) {
+      const usageRecord = record.usage as Record<string, unknown>;
+      const merged: ChatTokenUsage = { ...(this.usage || {}) };
+      if (typeof usageRecord.prompt_tokens === 'number') {
+        merged.prompt_tokens = usageRecord.prompt_tokens;
+      }
+      if (typeof usageRecord.completion_tokens === 'number') {
+        merged.completion_tokens = usageRecord.completion_tokens;
+      }
+      if (typeof usageRecord.total_tokens === 'number') {
+        merged.total_tokens = usageRecord.total_tokens;
+      }
+      this.usage = merged;
+    }
+    const choices = record.choices;
     if (!Array.isArray(choices)) {
       return;
     }
@@ -272,7 +338,16 @@ class AssistantResponseAccumulator {
       toolCalls: [...this.toolCalls.values()].sort(
         (left, right) => (left.index || 0) - (right.index || 0)
       ),
+      usage: this.usage,
     };
+  }
+
+  getContent(): string {
+    return this.content;
+  }
+
+  getUsage(): ChatTokenUsage | undefined {
+    return this.usage;
   }
 }
 
@@ -293,6 +368,14 @@ export class ReasoningStreamObserver {
     if (this.finished) return false;
     this.pending += this.decoder.write(chunk);
     return this.consumeEvents(false);
+  }
+
+  capturedContent(): string {
+    return this.accumulator.getContent();
+  }
+
+  capturedUsage(): CapturedAssistantResponse['usage'] {
+    return this.accumulator.getUsage();
   }
 
   finish(): boolean {
@@ -335,7 +418,6 @@ export class ReasoningStreamObserver {
         return this.commit();
       }
     } catch {
-      // Forwarding is independent of observation; malformed SSE is ignored.
     }
     return false;
   }
@@ -382,16 +464,16 @@ export class ReasoningBridge {
 
   prepareRequest(body: Buffer, scope: string): PreparedChatRequest {
     if (body.length > this.maxRequestBytes) {
-      return { body, injectedCount: 0 };
+      return this.emptyPreparedRequest(body);
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(body.toString('utf8'));
     } catch {
-      return { body, injectedCount: 0 };
+      return this.emptyPreparedRequest(body);
     }
     if (!parsed || typeof parsed !== 'object') {
-      return { body, injectedCount: 0 };
+      return this.emptyPreparedRequest(body);
     }
     const request = parsed as Record<string, unknown>;
     if (!Array.isArray(request.messages)) {
@@ -399,41 +481,85 @@ export class ReasoningBridge {
         body,
         model: typeof request.model === 'string' ? request.model : undefined,
         injectedCount: 0,
+        promotedAliasCount: 0,
+        assistantCount: 0,
+        missingReasoningCount: 0,
+        unresolvedCount: 0,
+        unresolvedToolCallCount: 0,
       };
     }
 
     this.prune();
     const messages = request.messages as ChatMessage[];
     const model = typeof request.model === 'string' ? request.model : undefined;
-    const requestFingerprint = fingerprint(messages);
+    const requestFingerprint = messagesFingerprint(messages);
     let injectedCount = 0;
+    let promotedAliasCount = 0;
+    let assistantCount = 0;
+    let missingReasoningCount = 0;
+    let unresolvedCount = 0;
+    let unresolvedToolCallCount = 0;
 
     for (let index = 0; index < messages.length; index++) {
       const message = messages[index];
       if (!message || message.role !== 'assistant') continue;
+      assistantCount++;
       if (
         typeof message.reasoning_content === 'string' &&
         message.reasoning_content.length > 0
       ) {
         continue;
       }
+      missingReasoningCount++;
+      const aliasReasoning = reasoningAliasText(message);
+      if (aliasReasoning) {
+        setReasoning(message, aliasReasoning);
+        promotedAliasCount++;
+        continue;
+      }
       const entry = this.findMatch(
         message,
-        fingerprint(messages.slice(0, index)),
+        messagesFingerprint(messages.slice(0, index)),
         scope,
         model
       );
       if (entry) {
-        message.reasoning_content = entry.reasoningContent;
+        setReasoning(message, entry.reasoningContent);
         injectedCount++;
+      } else {
+        unresolvedCount++;
+        if (messageToolCalls(message).length > 0) {
+          unresolvedToolCallCount++;
+        }
       }
     }
 
+    const modifiedCount = injectedCount + promotedAliasCount;
     return {
-      body: injectedCount > 0 ? Buffer.from(JSON.stringify(request), 'utf8') : body,
+      body:
+        modifiedCount > 0
+          ? Buffer.from(JSON.stringify(request), 'utf8')
+          : body,
       model,
       requestFingerprint,
       injectedCount,
+      promotedAliasCount,
+      assistantCount,
+      missingReasoningCount,
+      unresolvedCount,
+      unresolvedToolCallCount,
+    };
+  }
+
+  private emptyPreparedRequest(body: Buffer): PreparedChatRequest {
+    return {
+      body,
+      injectedCount: 0,
+      promotedAliasCount: 0,
+      assistantCount: 0,
+      missingReasoningCount: 0,
+      unresolvedCount: 0,
+      unresolvedToolCallCount: 0,
     };
   }
 
@@ -469,8 +595,7 @@ export class ReasoningBridge {
   ): boolean {
     if (
       !response.reasoningContent ||
-      response.reasoningContent.length > this.maxReasoningChars ||
-      (!response.content && response.toolCalls.length === 0)
+      response.reasoningContent.length > this.maxReasoningChars
     ) {
       return false;
     }
@@ -530,13 +655,18 @@ export class ReasoningBridge {
       const entryIds = toolCallIds(entry.toolCalls);
       const idsMatch =
         messageIds.length > 0 && sameStrings(messageIds, entryIds);
+      const idsContained = isStringSubset(messageIds, entryIds);
       const toolsMatch =
         messageCalls.length > 0 &&
         messageToolSignature === toolCallSignature(entry.toolCalls);
       const contentMatches =
         messageContent.length > 0 && messageContent === entry.content;
 
-      if (!idsMatch && !(contextMatches && (toolsMatch || contentMatches))) {
+      if (
+        !idsMatch &&
+        !idsContained &&
+        !(contextMatches && (toolsMatch || contentMatches))
+      ) {
         if (!(contextMatches && !messageContent && messageIds.length === 0)) {
           continue;
         }
@@ -545,6 +675,7 @@ export class ReasoningBridge {
       const score =
         (contextMatches ? 100 : 0) +
         (idsMatch ? 80 : 0) +
+        (idsContained && !idsMatch ? 60 : 0) +
         (toolsMatch ? 40 : 0) +
         (contentMatches ? 20 : 0);
       if (!best || score > best.score) {
@@ -567,4 +698,145 @@ export class ReasoningBridge {
     const cutoff = this.now() - this.ttlMs;
     this.entries = this.entries.filter((entry) => entry.lastUsedAt >= cutoff);
   }
+}
+
+
+const TOKEN_CHARS_PER_TOKEN = 4;
+
+function estimateTokenCount(text: string): number {
+  if (!text) return 0;
+  return Math.max(1, Math.ceil(text.length / TOKEN_CHARS_PER_TOKEN));
+}
+
+export interface EstimatedUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export function estimateUsage(
+  requestMessages: ChatMessage[] | undefined,
+  assistantContent: string
+): EstimatedUsage {
+  let promptChars = 0;
+  if (Array.isArray(requestMessages)) {
+    for (const message of requestMessages) {
+      promptChars += contentText(message.content).length;
+      if (Array.isArray(message.tool_calls)) {
+        for (const call of message.tool_calls) {
+          if (call?.function?.arguments) {
+            promptChars += JSON.stringify(call.function.arguments).length;
+          }
+        }
+      }
+      const reasoning =
+        typeof message.reasoning_content === 'string'
+          ? message.reasoning_content
+          : '';
+      promptChars += reasoning.length;
+    }
+  }
+  const prompt_tokens = estimateTokenCount('x'.repeat(promptChars));
+  const completion_tokens = estimateTokenCount(assistantContent);
+  return {
+    prompt_tokens,
+    completion_tokens,
+    total_tokens: prompt_tokens + completion_tokens,
+  };
+}
+
+/**
+ * 给 chat-completions 请求体注入 stream_options.include_usage=true。
+ * 返回新的 body(Buffer)与是否修改过的标记。
+ *  - 只对 stream===true 的 chat-completions 请求生效;
+ *  - 已显式声明 stream_options.include_usage=true 的不重复注入;
+ *  - JSON 解析失败或非对象 requestBody 则原样返回。
+ */
+export function ensureStreamUsageOptions(
+  body: Buffer
+): { body: Buffer; modified: boolean; requestMessages?: ChatMessage[] } {
+  if (body.length === 0 || body.length > 16 * 1024 * 1024) {
+    return { body, modified: false };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString('utf8'));
+  } catch {
+    return { body, modified: false };
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { body, modified: false };
+  }
+  const request = parsed as Record<string, unknown>;
+  if (request.stream !== true) {
+    return {
+      body,
+      modified: false,
+      requestMessages: Array.isArray(request.messages)
+        ? (request.messages as ChatMessage[])
+        : undefined,
+    };
+  }
+  let streamOptions = request.stream_options;
+  let needsInject = true;
+  if (
+    streamOptions &&
+    typeof streamOptions === 'object' &&
+    !Array.isArray(streamOptions)
+  ) {
+    const opts = streamOptions as Record<string, unknown>;
+    if (opts.include_usage === true) {
+      needsInject = false;
+    } else {
+      opts.include_usage = true;
+    }
+  } else {
+    streamOptions = { include_usage: true };
+    request.stream_options = streamOptions;
+  }
+  if (!needsInject) {
+    return {
+      body,
+      modified: false,
+      requestMessages: Array.isArray(request.messages)
+        ? (request.messages as ChatMessage[])
+        : undefined,
+    };
+  }
+  if (!streamOptions || typeof streamOptions !== 'object') {
+    return {
+      body,
+      modified: false,
+      requestMessages: Array.isArray(request.messages)
+        ? (request.messages as ChatMessage[])
+        : undefined,
+    };
+  }
+  (streamOptions as Record<string, unknown>).include_usage = true;
+  return {
+    body: Buffer.from(JSON.stringify(request), 'utf8'),
+    modified: true,
+    requestMessages: Array.isArray(request.messages)
+      ? (request.messages as ChatMessage[])
+      : undefined,
+  };
+}
+
+/**
+ * 把一个 usage 帧拼成 SSE data 行。
+ * 仅当上游 SSE 流末尾确实没出现 usage 时才发送。
+ */
+export function formatUsageSseFrame(
+  usage: EstimatedUsage,
+  model?: string
+): string {
+  const payload = {
+    id: 'chatcmpl-proxy-usage',
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: model || 'proxy',
+    choices: [],
+    usage,
+  };
+  return `data: ${JSON.stringify(payload)}\n\n`;
 }

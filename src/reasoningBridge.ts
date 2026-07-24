@@ -746,11 +746,11 @@ export function estimateUsage(
 }
 
 /**
- * 给 chat-completions 请求体注入 stream_options.include_usage=true。
- * 返回新的 body(Buffer)与是否修改过的标记。
- *  - 只对 stream===true 的 chat-completions 请求生效;
- *  - 已显式声明 stream_options.include_usage=true 的不重复注入;
- *  - JSON 解析失败或非对象 requestBody 则原样返回。
+ * Inject stream_options.include_usage=true into chat-completions request body.
+ * Returns the new body (Buffer) and a flag indicating whether it was modified.
+ *  - Only applies to chat-completions requests where stream===true;
+ *  - Skips injection if stream_options.include_usage=true is already explicitly set;
+ *  - If JSON parsing fails or requestBody is not an object, returns as-is.
  */
 export function ensureStreamUsageOptions(
   body: Buffer
@@ -823,8 +823,8 @@ export function ensureStreamUsageOptions(
 }
 
 /**
- * 把一个 usage 帧拼成 SSE data 行。
- * 仅当上游 SSE 流末尾确实没出现 usage 时才发送。
+ * Format a usage frame as SSE data lines.
+ * Only sent when the upstream SSE stream did not include usage at the end.
  */
 export function formatUsageSseFrame(
   usage: EstimatedUsage,

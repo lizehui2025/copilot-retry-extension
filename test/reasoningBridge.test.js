@@ -27,8 +27,8 @@ test('captures fragmented SSE reasoning and injects it into a tool-result reques
   const observer = bridge.observeStream(contextFor(prepared));
 
   const sse = [
-    'data: {"choices":[{"index":0,"delta":{"reasoning_content":"仔细"}}]}\n\n',
-    'data: {"choices":[{"index":0,"delta":{"reasoning_content":"思考"}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"reasoning_content":"Careful"}}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"reasoning_content":"thinking"}}]}\n\n',
     'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_","type":"function","function":{"name":"read_","arguments":"{\\"path\\":"}}]}}]}\n\n',
     'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"abc","function":{"name":"file","arguments":"\\"x\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
     'data: [DONE]\n\n',
@@ -66,7 +66,7 @@ test('captures fragmented SSE reasoning and injects it into a tool-result reques
   );
   const parsed = JSON.parse(followup.body.toString('utf8'));
   assert.equal(followup.injectedCount, 1);
-  assert.equal(parsed.messages[2].reasoning_content, '仔细思考');
+  assert.equal(parsed.messages[2].reasoning_content, 'Carefulthinking');
 });
 
 test('restores reasoning for every historical assistant message', () => {
@@ -196,11 +196,11 @@ test('does not cache incomplete streams and expires cached reasoning', () => {
 });
 
 test('caches reasoningContent-only responses with empty content', () => {
-  // 回归: DeepSeek 思考模式有时只输出 reasoning_content，content 为空字符串。
-  // 之前 record 会因为 (!content && !toolCalls) 丢弃响应，导致下一轮请求
-  // 缺失 reasoning_content，上游返回 10305。
+  // Regression: DeepSeek thinking mode sometimes only outputs reasoning_content with content as empty string.
+  // Previously record would discard the response due to (!content && !toolCalls), causing the next request
+  // to be missing reasoning_content, and the upstream returns 10305.
   const bridge = new ReasoningBridge();
-  const input = [{ role: 'user', content: '算 1+1' }];
+  const input = [{ role: 'user', content: 'Calculate 1+1' }];
   const prepared = bridge.prepareRequest(request(input), scope);
   const observer = bridge.observeStream(contextFor(prepared));
   observer.push(
@@ -220,7 +220,7 @@ test('caches reasoningContent-only responses with empty content', () => {
     request([
       ...input,
       { role: 'assistant', content: '' },
-      { role: 'user', content: '再算 2+2' },
+      { role: 'user', content: 'Now calculate 2+2' },
     ]),
     scope
   );

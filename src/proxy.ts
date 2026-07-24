@@ -18,6 +18,7 @@ export interface ProxyConfig {
   backoffMultiplier: number;
   maxBackoffMs: number;
   upstreams: Record<string, string>;
+  sniffTimeoutMs: number;  // First frame sniff timeout in milliseconds
 }
 
 export type LogLevel = 'info' | 'warn' | 'error';
@@ -88,20 +89,77 @@ function isSignedRequest(
   headers: Record<string, string | string[] | undefined>
 ): boolean {
   const authorization = headerValue(headers, 'authorization');
+  
+  // Detect HMAC/signature-based auth schemes (these become invalid when request body changes)
+  // Note: Bearer tokens and API Keys are just identity verification and won't be invalidated by body modification
   if (/^(aws4-hmac|hmac|signature|digest)\b/i.test(authorization)) {
     return true;
   }
+  
+  // Common signature-related header detection
+  // Only includes headers that change with request body content, not pure authentication headers
   const signatureHeaders = new Set([
+    // AWS signatures (change with request body)
+    'content-md5',
     'content-digest',
     'digest',
     'x-amz-content-sha256',
+    'x-amz-signature',
+    'x-amz-credential',
+    'x-amz-algorithm',
+    'x-aws-signature',
+    // Anthropic signatures (change with request body)
+    'x-anthropic-signature',
+    // Google Cloud signatures (change with request body)
+    'x-goog-signature',
+    // Generic signature headers (change with request body)
     'x-body-signature',
     'x-content-signature',
     'x-signature',
+    'x-hmac-signature',
+    'x-request-signature',
+    'x-signature-version',
+    // Third-party platform HMAC signatures
+    'x-slack-signature',
+    'x-shopify-hmac-sha256',
+    'x-verify',
   ]);
-  return Object.keys(headers).some((key) =>
-    signatureHeaders.has(key.toLowerCase())
-  );
+  
+  // Check for signature-related headers
+  const headerKeys = Object.keys(headers);
+  for (const key of headerKeys) {
+    const lowerKey = key.toLowerCase();
+    // Direct match
+    if (signatureHeaders.has(lowerKey)) {
+      return true;
+    }
+    // Prefix match (e.g. x-shopify-)
+    if (lowerKey.startsWith('x-shopify-') || lowerKey.startsWith('x-slack-')) {
+      return true;
+    }
+  }
+  
+  // Additional detection: Authorization header contains signature-based auth schemes
+  if (authorization) {
+    const authLower = authorization.toLowerCase();
+    // Only detect signature schemes that change with request body
+    const signatureKeywords = [
+      'aws4-',           // AWS Signature V4
+      'aws4-hmac',       // AWS Signature V4
+      'hmac-sha',        // HMAC variant
+      'signature=',      // Signature parameter
+      'signed=',         // Signed request
+      'oauth ',          // OAuth 1.0 signature (note the space to avoid matching oauth2)
+      'oauth1',          // OAuth 1.0
+    ];
+    for (const keyword of signatureKeywords) {
+      if (authLower.includes(keyword)) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
 }
 
 function isChatCompletionsRequest(
@@ -260,8 +318,8 @@ function collectResponse(res: http.IncomingMessage): Promise<Buffer> {
 }
 
 /**
- * 轻量 SSE usage 嗅探器：扫描每个上游到达的 chunk 是否包含带 usage 的 data 帧。
- * 仅检测缓冲区是否出现 `"usage":{"prompt_tokens"`，避免对每个 chunk 都 JSON.parse。
+ * Lightweight SSE usage sniffer: scans each upstream chunk for data frames containing usage.
+ * Only checks if the buffer contains `"usage":{"prompt_tokens"`, avoiding JSON.parse on every chunk.
  */
 class StreamUsageDetector {
   private pending = '';
@@ -498,7 +556,7 @@ async function handleRequest(
     if (usageOptions.modified) {
       log(
         'info',
-        '[usage] 已注入 stream_options.include_usage=true,上游将在流末尾发送 usage 帧'
+        '[usage] Injected stream_options.include_usage=true, upstream will send usage frame at stream end'
       );
     }
   }
@@ -525,7 +583,7 @@ async function handleRequest(
     if (preparedRequest.injectedCount > 0) {
       log(
         'info',
-        `[reasoning] 已为 ${preparedRequest.injectedCount} 条 assistant 消息回填 reasoning_content`
+        `[reasoning] Backfilled reasoning_content for ${preparedRequest.injectedCount} assistant messages`
       );
     }
     if (
@@ -535,15 +593,15 @@ async function handleRequest(
       log(
         preparedRequest.unresolvedCount > 0 ? 'warn' : 'info',
         `[reasoning] assistant=${preparedRequest.assistantCount}, ` +
-          `原缺失=${preparedRequest.missingReasoningCount}, ` +
-          `别名恢复=${preparedRequest.promotedAliasCount}, ` +
-          `缓存回填=${preparedRequest.injectedCount}, ` +
-          `仍缺失=${preparedRequest.unresolvedCount}, ` +
-          `其中工具消息=${preparedRequest.unresolvedToolCallCount}`
+          `missing=${preparedRequest.missingReasoningCount}, ` +
+          `alias_restored=${preparedRequest.promotedAliasCount}, ` +
+          `cache_backfilled=${preparedRequest.injectedCount}, ` +
+          `still_missing=${preparedRequest.unresolvedCount}, ` +
+          `tool_msg_missing=${preparedRequest.unresolvedToolCallCount}`
       );
     }
   } else if (reasoningEligible) {
-    log('warn', '[reasoning] 请求包含内容签名，已跳过 reasoning_content 注入');
+    log('warn', '[reasoning] Request contains content signature, skipping reasoning_content injection');
   }
   const reqHeaders = rawHeaders;
 
@@ -554,7 +612,7 @@ async function handleRequest(
     try {
       if (attempt > 0) {
         const delay = getBackoffDelay(attempt - 1, config);
-        log('info', `[retry ${attempt}/${config.maxRetries}] 等待 ${delay}ms 后重试 ${maskUrl(targetUrl)}`);
+        log('info', `[retry ${attempt}/${config.maxRetries}] Waiting ${delay}ms before retrying ${maskUrl(targetUrl)}`);
         await sleep(delay);
       }
 
@@ -575,7 +633,7 @@ async function handleRequest(
         const body = await collectResponse(upstreamRes);
         const bodyText = body.toString('utf8');
         if (shouldRetry(statusCode, bodyText) && attempt < config.maxRetries) {
-          log('warn', `[retry] 触发重试: status=${statusCode} body=${bodyText.slice(0, 200)}`);
+          log('warn', `[retry] Triggered retry: status=${statusCode} body=${bodyText.slice(0, 200)}`);
           continue;
         }
 
@@ -585,7 +643,7 @@ async function handleRequest(
           statusCode < 300 &&
           reasoningBridge.captureJsonResponse(body, responseContext)
         ) {
-          log('info', '[reasoning] 已缓存非流式响应的思考上下文');
+          log('info', '[reasoning] Cached reasoning context from non-streaming response');
         }
 
         let outBody = body;
@@ -602,7 +660,7 @@ async function handleRequest(
             preparedRequest.model
           );
           if (outBody.length !== before) {
-            log('info', '[usage] 非流式响应缺少 usage 字段,已补全估算值');
+            log('info', '[usage] Non-streaming response missing usage field, estimated value added');
           }
         }
 
@@ -615,10 +673,10 @@ async function handleRequest(
 
       let firstChunk: Buffer;
       try {
-        const sniffed = await sniffFirstChunk(upstreamRes);
+        const sniffed = await sniffFirstChunk(upstreamRes, config.sniffTimeoutMs);
         if (sniffed.kind === 'retry') {
           if (attempt < config.maxRetries) {
-            log('warn', '[retry] 流首帧携带结构化错误信号，准备重试');
+            log('warn', '[retry] Stream first frame carries structured error signal, preparing to retry');
             upstreamRes.destroy();
             continue;
           }
@@ -629,12 +687,70 @@ async function handleRequest(
         }
         firstChunk = sniffed.firstChunk;
       } catch (err) {
-        if (attempt < config.maxRetries && isNetworkError(err as Error)) {
-          log('warn', `[retry] 嗅探首帧网络错误，尝试重试: ${(err as Error).message}`);
+        const errMsg = (err as Error).message;
+        // Timeout error should not trigger retry as upstream may just be slow, continue forwarding data
+        if (errMsg.includes('timeout')) {
+          log('warn', `[stream] Sniff first frame timeout (${config.sniffTimeoutMs}ms), continuing to wait for first frame data`);
+          // Don't destroy the connection, let it continue flowing
+          upstreamRes.resume();
+          // Wait for first frame data, at most another sniffTimeoutMs
+          try {
+            const firstData = await new Promise<Buffer>((resolve, reject) => {
+              const timeout = setTimeout(() => {
+                reject(new Error('wait first chunk timeout'));
+              }, config.sniffTimeoutMs);
+              
+              const onChunk = (chunk: Buffer) => {
+                clearTimeout(timeout);
+                upstreamRes.removeListener('data', onChunk);
+                upstreamRes.removeListener('end', onEnd);
+                upstreamRes.removeListener('error', onError);
+                resolve(chunk);
+              };
+              const onEnd = () => {
+                clearTimeout(timeout);
+                upstreamRes.removeListener('data', onChunk);
+                upstreamRes.removeListener('end', onEnd);
+                upstreamRes.removeListener('error', onError);
+                resolve(Buffer.alloc(0));
+              };
+              const onError = (e: Error) => {
+                clearTimeout(timeout);
+                upstreamRes.removeListener('data', onChunk);
+                upstreamRes.removeListener('end', onEnd);
+                upstreamRes.removeListener('error', onError);
+                reject(e);
+              };
+              
+              upstreamRes.once('data', onChunk);
+              upstreamRes.once('end', onEnd);
+              upstreamRes.once('error', onError);
+            });
+            
+            if (firstData.length > 0) {
+              if (isFirstFrameStreamError(firstData) && attempt < config.maxRetries) {
+                log('warn', '[retry] First frame received after wait carries error signal, preparing to retry');
+                upstreamRes.destroy();
+                continue;
+              }
+              firstChunk = firstData;
+            } else {
+              // Upstream ended prematurely
+              log('warn', '[stream] Upstream ended while waiting for first frame');
+              upstreamRes.destroy();
+              return;
+            }
+          } catch (waitErr) {
+            log('error', `[stream] Failed to wait for first frame data: ${(waitErr as Error).message}`);
+            upstreamRes.destroy();
+            return;
+          }
+        } else if (attempt < config.maxRetries && isNetworkError(err as Error)) {
+          log('warn', `[retry] Sniff first frame network error, attempting retry: ${errMsg}`);
           upstreamRes.destroy();
           continue;
         }
-        log('error', `[stream] 嗅探首帧失败: ${(err as Error).message}`);
+        log('error', `[stream] Sniff first frame failed: ${(err as Error).message}`);
         if (attempt < config.maxRetries) {
           upstreamRes.destroy();
           continue;
@@ -657,7 +773,7 @@ async function handleRequest(
       const observeReasoningChunk = (chunk: Buffer) => {
         if (reasoningObserver?.push(chunk) && !reasoningCacheLogged) {
           reasoningCacheLogged = true;
-          log('info', '[reasoning] 已缓存流式响应的思考上下文');
+          log('info', '[reasoning] Cached reasoning context from streaming response');
         }
       };
       observeReasoningChunk(firstChunk);
@@ -665,13 +781,13 @@ async function handleRequest(
       const usageDetector = new StreamUsageDetector();
       usageDetector.push(firstChunk);
 
-      const idleTimeoutMs = 60000; // 60 秒无数据视为超时
+      const idleTimeoutMs = 60000; // 60s idle timeout
       let idleTimer: NodeJS.Timeout | null = null;
 
       const resetIdleTimer = () => {
         if (idleTimer) clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
-          log('warn', `[stream] 上游无数据超过 ${idleTimeoutMs}ms，触发超时断开`);
+          log('warn', `[stream] Upstream no data for ${idleTimeoutMs}ms, triggering idle timeout disconnect`);
           upstreamRes.destroy(new Error('upstream idle timeout'));
         }, idleTimeoutMs);
       };
@@ -730,7 +846,7 @@ async function handleRequest(
           upstreamEnded = true;
           if (reasoningObserver?.finish() && !reasoningCacheLogged) {
             reasoningCacheLogged = true;
-            log('info', '[reasoning] 已缓存流式响应的思考上下文');
+            log('info', '[reasoning] Cached reasoning context from streaming response');
           }
           if (
             reasoningEligible &&
@@ -749,7 +865,7 @@ async function handleRequest(
               res.write(frame);
               log(
                 'info',
-                `[usage] 上游未回 usage,已补估算帧 prompt≈${usage.prompt_tokens} completion≈${usage.completion_tokens}`
+                `[usage] Upstream did not return usage, estimated frame added prompt≈${usage.prompt_tokens} completion≈${usage.completion_tokens}`
               );
             } catch {
             }
@@ -758,7 +874,7 @@ async function handleRequest(
           finish();
         };
         const onUpstreamError = (err: Error) => {
-          log('error', `[stream] 流中途断开: ${err.message}`);
+          log('error', `[stream] Stream disconnected mid-way: ${err.message}`);
           if (!res.destroyed) {
             res.destroy(err);
           }
@@ -797,7 +913,7 @@ async function handleRequest(
       return;
     } catch (err) {
       lastError = err as Error;
-      log('error', `[attempt ${attempt + 1}] 请求失败: ${(err as Error).message}`);
+      log('error', `[attempt ${attempt + 1}] Request failed: ${(err as Error).message}`);
       if (res.headersSent) {
         if (!res.destroyed) {
           res.destroy(err as Error);
@@ -810,7 +926,7 @@ async function handleRequest(
     }
   }
 
-  log('error', '[fatal] 所有重试均失败');
+  log('error', '[fatal] All retries exhausted');
   if (!res.headersSent) {
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(
@@ -844,7 +960,7 @@ export class RetryProxy {
 
   async start(): Promise<void> {
     if (this.server) {
-      this.pushLog('info', '代理已在运行中');
+      this.pushLog('info', 'Proxy is already running');
       return;
     }
 
@@ -858,7 +974,7 @@ export class RetryProxy {
           this.reasoningBridge
         ).catch(
           (err) => {
-            this.pushLog('error', `handleRequest 异常: ${(err as Error).message}`);
+            this.pushLog('error', `handleRequest exception: ${(err as Error).message}`);
             if (!res.headersSent) {
               res.writeHead(500, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: 'Internal proxy error' }));
@@ -868,13 +984,20 @@ export class RetryProxy {
       });
 
       this.server.on('error', (err) => {
-        this.pushLog('error', `服务器错误: ${err.message}`);
+        this.pushLog('error', `Server error: ${err.message}`);
         this.server = null;
-        reject(err);
+        // Provide more user-friendly error messages
+        if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+          reject(new Error(`Port ${this.config.port} is already in use, please change the port or close the occupying process`));
+        } else if ((err as NodeJS.ErrnoException).code === 'EACCES') {
+          reject(new Error(`Port ${this.config.port} requires administrator privileges, please use a higher port or run as administrator`));
+        } else {
+          reject(err);
+        }
       });
 
       this.server.listen(this.config.port, '127.0.0.1', () => {
-        this.pushLog('info', `代理已启动: http://127.0.0.1:${this.config.port}`);
+        this.pushLog('info', `Proxy started: http://127.0.0.1:${this.config.port}`);
         for (const [prefix, base] of Object.entries(this.config.upstreams)) {
           this.pushLog('info', `  ${prefix}/* → ${base}/*`);
         }
@@ -885,12 +1008,12 @@ export class RetryProxy {
 
   async stop(): Promise<void> {
     if (!this.server) {
-      this.pushLog('info', '代理未运行');
+      this.pushLog('info', 'Proxy is not running');
       return;
     }
     return new Promise<void>((resolve) => {
       this.server!.close(() => {
-        this.pushLog('info', '代理已停止');
+        this.pushLog('info', 'Proxy stopped');
         this.server = null;
         agentManager.destroyAll();
         this.reasoningBridge.clear();
@@ -914,5 +1037,10 @@ export class RetryProxy {
 
   getConfig(): ProxyConfig {
     return { ...this.config };
+  }
+
+  updateConfig(config: ProxyConfig): void {
+    this.config = config;
+    this.pushLog('info', 'Proxy config hot-updated');
   }
 }

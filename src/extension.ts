@@ -58,11 +58,26 @@ function getChatLanguageModelsPath(): string | undefined {
 }
 
 let isRewriting = false;
+let lastSyncResult: { upstreams: Record<string, string>; rewritten: boolean; timestamp: number } | null = null;
+const SYNC_CACHE_TTL_MS = 5000; // Sync result cache TTL in ms
+
+// Sync lock ensures the sync process is not executed concurrently
+let syncLock = false;
 
 function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten: boolean } {
+  // If sync is in progress, return cached result to avoid blocking
+  if (syncLock) {
+    if (lastSyncResult && Date.now() - lastSyncResult.timestamp < SYNC_CACHE_TTL_MS) {
+      return { upstreams: lastSyncResult.upstreams, rewritten: false };
+    }
+    return { upstreams: loadUpstreamsFromFile(), rewritten: false };
+  }
+  
   if (isRewriting) {
     return { upstreams: loadUpstreamsFromFile(), rewritten: false };
   }
+  
+  syncLock = true;
   const result: Record<string, string> = loadUpstreamsFromFile();
   if (!chatModelsPath || !fs.existsSync(chatModelsPath)) {
     return { upstreams: result, rewritten: false };
@@ -72,7 +87,7 @@ function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten
     content = fs.readFileSync(chatModelsPath, 'utf8');
   } catch (err) {
     outputChannel.appendLine(
-      `[${new Date().toISOString()}] [ERROR] 读取 chatLanguageModels.json 失败: ${(err as Error).message}`
+      `[${new Date().toISOString()}] [ERROR] Failed to read chatLanguageModels.json: ${(err as Error).message}`
     );
     return { upstreams: result, rewritten: false };
   }
@@ -81,7 +96,7 @@ function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten
     parsed = JSON.parse(content);
   } catch (err) {
     outputChannel.appendLine(
-      `[${new Date().toISOString()}] [ERROR] 解析 chatLanguageModels.json 失败: ${(err as Error).message}`
+      `[${new Date().toISOString()}] [ERROR] Failed to parse chatLanguageModels.json: ${(err as Error).message}`
     );
     return { upstreams: result, rewritten: false };
   }
@@ -97,7 +112,7 @@ function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten
   }
   if (recovered.sources.length > 0) {
     outputChannel.appendLine(
-      `[${new Date().toISOString()}] [INFO] 已自动恢复上游映射: ${Object.keys(recovered.upstreams).join(', ')}（来源: ${recovered.sources.join(', ')}）`
+      `[${new Date().toISOString()}] [INFO] Auto-recovered upstream mappings: ${Object.keys(recovered.upstreams).join(', ')} (sources: ${recovered.sources.join(', ')})`
     );
   }
   let rewritten = false;
@@ -143,7 +158,7 @@ function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten
   if (rewritten) {
     if (!mappingPersisted) {
       outputChannel.appendLine(
-        `[${new Date().toISOString()}] [ERROR] 上游映射未能安全落盘，已取消改写 chatLanguageModels.json`
+        `[${new Date().toISOString()}] [ERROR] Upstream mapping failed to persist safely, aborting chatLanguageModels.json rewrite`
       );
       return { upstreams: finalUpstreams, rewritten: false };
     }
@@ -153,16 +168,26 @@ function syncChatModelsToProxy(): { upstreams: Record<string, string>; rewritten
       fs.writeFileSync(backupPath, content, 'utf8');
       fs.writeFileSync(chatModelsPath, JSON.stringify(entries, null, 2), 'utf8');
       outputChannel.appendLine(
-        `[${new Date().toISOString()}] [INFO] 已自动改写 chatLanguageModels.json 中的 URL 为代理地址（原文件备份于 ${backupPath}）`
+        `[${new Date().toISOString()}] [INFO] Auto-rewrote URLs in chatLanguageModels.json to proxy addresses (original backed up at ${backupPath})`
       );
     } catch (err) {
       outputChannel.appendLine(
-        `[${new Date().toISOString()}] [ERROR] 写入 chatLanguageModels.json 失败: ${(err as Error).message}`
+        `[${new Date().toISOString()}] [ERROR] Failed to write chatLanguageModels.json: ${(err as Error).message}`
       );
     } finally {
       isRewriting = false;
+      syncLock = false;
     }
   }
+  
+  // Cache result
+  lastSyncResult = {
+    upstreams: finalUpstreams,
+    rewritten,
+    timestamp: Date.now()
+  };
+  
+  syncLock = false;
   return { upstreams: finalUpstreams, rewritten };
 }
 
@@ -174,7 +199,7 @@ function saveUpstreamsToFile(upstreams: Record<string, string>): boolean {
     if (fs.existsSync(configPath)) {
       const existing: unknown = JSON.parse(fs.readFileSync(configPath, 'utf8'));
       if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
-        throw new Error('现有 upstreams.json 不是有效对象，拒绝覆盖');
+        throw new Error('Existing upstreams.json is not a valid object, refusing to overwrite');
       }
       for (const [prefix, base] of Object.entries(existing)) {
         if (typeof base === 'string' && base.trim()) {
@@ -195,7 +220,7 @@ function saveUpstreamsToFile(upstreams: Record<string, string>): boolean {
       // Ignore cleanup failures; the uniquely named temp file is harmless.
     }
     outputChannel.appendLine(
-      `[${new Date().toISOString()}] [ERROR] 写入 upstreams.json 失败: ${(err as Error).message}`
+      `[${new Date().toISOString()}] [ERROR] Failed to write upstreams.json: ${(err as Error).message}`
     );
     return false;
   }
@@ -223,7 +248,7 @@ function loadUpstreamsFromFile(): Record<string, string> {
     }
   } catch (err) {
     outputChannel.appendLine(
-      `[${new Date().toISOString()}] [ERROR] 读取 upstreams.json 失败: ${(err as Error).message}`
+      `[${new Date().toISOString()}] [ERROR] Failed to read upstreams.json: ${(err as Error).message}`
     );
   }
   return result;
@@ -239,6 +264,7 @@ function getConfig(): ProxyConfig {
     initialBackoffMs: cfg.get('initialBackoffMs', 1000),
     backoffMultiplier: cfg.get('backoffMultiplier', 2),
     maxBackoffMs: cfg.get('maxBackoffMs', 30000),
+    sniffTimeoutMs: cfg.get('sniffTimeoutMs', 30000),  // First frame sniff timeout, default 30s
     upstreams: { ...upstreams, ...configured },
   };
 }
@@ -246,11 +272,11 @@ function getConfig(): ProxyConfig {
 function updateStatusBar(): void {
   if (proxy && proxy.isRunning()) {
     statusBarItem.text = '$(globe) Retry Proxy: ON';
-    statusBarItem.tooltip = 'Copilot Retry Proxy 正在运行';
+    statusBarItem.tooltip = 'Copilot Retry Proxy is running';
     statusBarItem.backgroundColor = undefined;
   } else {
     statusBarItem.text = '$(circle-slash) Retry Proxy: OFF';
-    statusBarItem.tooltip = 'Copilot Retry Proxy 已停止';
+    statusBarItem.tooltip = 'Copilot Retry Proxy has stopped';
     statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
   }
 }
@@ -262,13 +288,13 @@ function log(level: 'info' | 'warn' | 'error', message: string): void {
 
 async function startProxy(): Promise<void> {
   if (proxy && proxy.isRunning()) {
-    vscode.window.showInformationMessage('Copilot Retry Proxy 已在运行中');
+    vscode.window.showInformationMessage('Copilot Retry Proxy is already running');
     return;
   }
   const config = getConfig();
   if (Object.keys(config.upstreams).length === 0) {
     vscode.window.showWarningMessage(
-      'Copilot Retry Proxy: 未检测到上游 API。请在 chatLanguageModels.json 中配置真实 API 地址。'
+      'Copilot Retry Proxy: No upstream APIs detected. Please configure real API URLs in chatLanguageModels.json.'
     );
     return;
   }
@@ -277,48 +303,66 @@ async function startProxy(): Promise<void> {
     await proxy.start();
     updateStatusBar();
     vscode.window.showInformationMessage(
-      `Copilot Retry Proxy 已启动 (端口 ${config.port})`
+      `Copilot Retry Proxy started (port ${config.port})`
     );
   } catch (err) {
     vscode.window.showErrorMessage(
-      `Copilot Retry Proxy 启动失败: ${(err as Error).message}`
+      `Copilot Retry Proxy failed to start: ${(err as Error).message}`
     );
   }
 }
 
 async function stopProxy(): Promise<void> {
   if (!proxy) {
-    vscode.window.showInformationMessage('Copilot Retry Proxy 未运行');
+    vscode.window.showInformationMessage('Copilot Retry Proxy is not running');
     return;
   }
   await proxy.stop();
   updateStatusBar();
-  vscode.window.showInformationMessage('Copilot Retry Proxy 已停止');
+  vscode.window.showInformationMessage('Copilot Retry Proxy has stopped');
 }
 
 async function restartProxy(): Promise<void> {
-  if (proxy) {
-    await proxy.stop();
-  }
   const config = getConfig();
   if (Object.keys(config.upstreams).length === 0) {
-    proxy = null;
+    if (proxy) {
+      await proxy.stop();
+      proxy = null;
+    }
     updateStatusBar();
     vscode.window.showWarningMessage(
-      'Copilot Retry Proxy: 上游映射为空，代理未启动。请恢复真实 API URL 或配置 copilotRetryProxy.upstreams。'
+      'Copilot Retry Proxy: Upstream mapping is empty, proxy not started. Please restore real API URLs or configure copilotRetryProxy.upstreams.'
     );
     return;
   }
+
+  // If proxy is already running, try hot config update
+  if (proxy && proxy.isRunning()) {
+    // Check if port changed; if so, full restart is needed
+    const currentConfig = proxy.getConfig();
+    if (currentConfig.port === config.port) {
+      // Port unchanged, try hot config update
+      proxy.updateConfig(config);
+      updateStatusBar();
+      vscode.window.showInformationMessage(
+        'Copilot Retry Proxy config hot-reloaded'
+      );
+      return;
+    }
+    // Port changed, need full restart
+    await proxy.stop();
+  }
+  
   proxy = new RetryProxy(config, log);
   try {
     await proxy.start();
     updateStatusBar();
     vscode.window.showInformationMessage(
-      `Copilot Retry Proxy 已重启 (端口 ${config.port})`
+      `Copilot Retry Proxy started (port ${config.port})`
     );
   } catch (err) {
     vscode.window.showErrorMessage(
-      `Copilot Retry Proxy 重启失败: ${(err as Error).message}`
+      `Copilot Retry Proxy failed to start: ${(err as Error).message}`
     );
   }
 }
@@ -337,16 +381,16 @@ function maskHost(url: string): string {
 
 function showStatus(): void {
   if (!proxy || !proxy.isRunning()) {
-    vscode.window.showInformationMessage('Copilot Retry Proxy: 未运行');
+    vscode.window.showInformationMessage('Copilot Retry Proxy: Not running');
     return;
   }
   const config = proxy.getConfig();
   const lines = [
-    `状态: 运行中`,
-    `监听: http://127.0.0.1:${config.port}`,
-    `最大重试: ${config.maxRetries} 次`,
-    `退避: ${config.initialBackoffMs}ms × ${config.backoffMultiplier}^n (上限 ${config.maxBackoffMs}ms)`,
-    `上游映射:`,
+    `Status: Running`,
+    `Listen: http://127.0.0.1:${config.port}`,
+    `Max retries: ${config.maxRetries}`,
+    `Backoff: ${config.initialBackoffMs}ms × ${config.backoffMultiplier}^n (cap ${config.maxBackoffMs}ms)`,
+    `Upstream mapping:`,
     ...Object.entries(config.upstreams).map(
       ([k, v]) => `  ${k}/* → ${maskHost(v)}/*`
     ),
@@ -390,7 +434,7 @@ export function activate(context: vscode.ExtensionContext): void {
     chatModelsPath = detected;
   } else {
     outputChannel.appendLine(
-      `[${new Date().toISOString()}] [WARN] 未找到 chatLanguageModels.json，请在 VS Code 中先配置一个 customendpoint 模型后重载`
+      `[${new Date().toISOString()}] [WARN] chatLanguageModels.json not found. Please configure a custom endpoint model in VS Code and reload`
     );
   }
 
@@ -411,8 +455,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('copilotRetryProxy')) {
         if (proxy && proxy.isRunning()) {
-          log('info', '配置已变更，重启代理...');
-          restartProxy();
+          log('info', 'Configuration changed, restarting proxy...');
+          restartProxy().catch((err) => {
+            log('error', `Config change restart failed: ${(err as Error).message}`);
+          });
         }
       }
     })
@@ -426,7 +472,7 @@ export function activate(context: vscode.ExtensionContext): void {
         clearTimeout(debounceTimer);
       }
       debounceTimer = setTimeout(() => {
-        log('info', '检测到 chatLanguageModels.json 变更，重新加载上游映射...');
+        log('info', 'chatLanguageModels.json changed, reloading upstream mapping...');
         const enabled = vscode.workspace
           .getConfiguration('copilotRetryProxy')
           .get<boolean>('enabled', true);
@@ -451,7 +497,17 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): Thenable<void> | undefined {
   if (proxy) {
-    return proxy.stop();
+    const stopPromise = proxy.stop();
+    // Ensure status bar reflects stopped state
+    if (statusBarItem) {
+      statusBarItem.text = '$(circle-slash) Retry Proxy: OFF';
+      statusBarItem.tooltip = 'Copilot Retry Proxy has stopped';
+      statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+    }
+    outputChannel.appendLine(
+      `[${new Date().toISOString()}] [INFO] Extension deactivated, proxy closed`
+    );
+    return stopPromise;
   }
   return undefined;
 }

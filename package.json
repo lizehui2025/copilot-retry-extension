@@ -1,7 +1,7 @@
 {
   "name": "copilot-retry-proxy",
   "displayName": "Copilot Retry Proxy",
-  "description": "本地重试代理，自动重试第三方 API 的限流错误（11210 / 429 / 5xx）",
+  "description": "Local retry proxy that auto-retries third-party API rate limit errors (11210 / 429 / 5xx)",
   "version": "0.0.7",
   "publisher": "ITAS6666",
   "license": "MIT",
@@ -23,27 +23,27 @@
     "commands": [
       {
         "command": "copilotRetryProxy.start",
-        "title": "Copilot Retry Proxy: 启动代理"
+        "title": "Copilot Retry Proxy: Start Proxy"
       },
       {
         "command": "copilotRetryProxy.stop",
-        "title": "Copilot Retry Proxy: 停止代理"
+        "title": "Copilot Retry Proxy: Stop Proxy"
       },
       {
         "command": "copilotRetryProxy.restart",
-        "title": "Copilot Retry Proxy: 重启代理"
+        "title": "Copilot Retry Proxy: Restart Proxy"
       },
       {
         "command": "copilotRetryProxy.showStatus",
-        "title": "Copilot Retry Proxy: 查看状态"
+        "title": "Copilot Retry Proxy: Show Status"
       },
       {
         "command": "copilotRetryProxy.showLog",
-        "title": "Copilot Retry Proxy: 查看日志"
+        "title": "Copilot Retry Proxy: Show Log"
       },
       {
         "command": "copilotRetryProxy.openConfig",
-        "title": "Copilot Retry Proxy: 打开上游配置文件"
+        "title": "Copilot Retry Proxy: Open Upstream Config"
       }
     ],
     "configuration": {
@@ -52,37 +52,42 @@
         "copilotRetryProxy.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "是否在 VS Code 启动时自动启动代理"
+          "description": "Auto-start proxy when VS Code starts"
         },
         "copilotRetryProxy.port": {
           "type": "number",
           "default": 8787,
-          "description": "代理监听端口"
+          "description": "Proxy listen port"
         },
         "copilotRetryProxy.maxRetries": {
           "type": "number",
           "default": 5,
-          "description": "最大重试次数"
+          "description": "Maximum retry count"
         },
         "copilotRetryProxy.initialBackoffMs": {
           "type": "number",
           "default": 1000,
-          "description": "初始退避时间（毫秒）"
+          "description": "Initial backoff time (ms)"
         },
         "copilotRetryProxy.backoffMultiplier": {
           "type": "number",
           "default": 2,
-          "description": "退避倍数"
+          "description": "Backoff multiplier"
         },
         "copilotRetryProxy.maxBackoffMs": {
           "type": "number",
           "default": 30000,
-          "description": "最大退避时间（毫秒）"
+          "description": "Maximum backoff time (ms)"
+        },
+        "copilotRetryProxy.sniffTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "description": "First-frame sniff timeout (ms). Increase for slow upstreams"
         },
         "copilotRetryProxy.upstreams": {
           "type": "object",
           "default": {},
-          "description": "上游映射：路径前缀 → 上游 baseURL。留空则自动从 upstreams.json 读取",
+          "description": "Upstream mapping: path prefix → upstream baseURL. Leave empty to auto-read from upstreams.json",
           "additionalProperties": {
             "type": "string"
           }

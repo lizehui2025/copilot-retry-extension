@@ -3,57 +3,57 @@
 ## [0.0.7] - 2026-07-15
 
 ### Fixed
-- 兼容 Copilot 将多工具响应拆分为多个 assistant 消息的情况：工具调用 ID 会忽略 `__vscode-*` 执行后缀，并允许用原响应工具集合的子集安全匹配思考内容。
-- 当 Copilot 仅保留 `reasoning` 时，自动提升为上游要求的 `reasoning_content`；`cot_summary` 作为兼容性兜底。
+- Compatible with Copilot splitting multi-tool responses into multiple assistant messages: tool call IDs ignore `__vscode-*` execution suffixes and allow safe matching of thinking content using a subset of the original response tool set.
+- When Copilot only keeps `reasoning`, automatically promote it to the upstream-required `reasoning_content`; `cot_summary` serves as a compatibility fallback.
 
 ### Added
-- 为每次思考模式请求记录 assistant 总数、原缺失数、缓存回填数及仍未解决的工具消息数，不记录消息正文或思考内容。
+- For each thinking mode request, log the total assistant count, original missing count, cache backfill count, and unresolved tool message count — without logging message body or thinking content.
 
 ## [0.0.6] - 2026-07-15
 
 ### Fixed
-- 修复 DeepSeek 思考模式只输出 `reasoning_content`（`content` 为空字符串、无 `tool_calls`）的响应被 `ReasoningBridge.record()` 误丢弃的问题。之前这类响应因 `(!content && !toolCalls)` 过滤条件被忽略，导致下一轮请求未能回填 `reasoning_content`，上游 API 返回 400 `10305`（"The reasoning_content in the thinking mode must be passed back to the API."）。
+- Fixed an issue where DeepSeek thinking-mode responses that only output `reasoning_content` (with `content` as an empty string and no `tool_calls`) were incorrectly discarded by `ReasoningBridge.record()`. Previously, such responses were ignored due to the `(!content && !toolCalls)` filter condition, causing the next request to fail to backfill `reasoning_content`, resulting in upstream API error 400 `10305` ("The reasoning_content in the thinking mode must be passed back to the API.").
 
 ## [0.0.5] - 2026-07-14
 
 ### Added
-- 思考模式兼容：缓存流式/非流式响应中的 `reasoning_content`，在后续工具调用请求中自动回填
-- 上游映射自动恢复机制：从 `.bak` 备份、扩展 storage、本地历史记录中恢复丢失的上游映射
-- `copilotRetryProxy.openConfig` 命令：在编辑器中打开上游配置文件
+- Thinking mode compatibility: cache `reasoning_content` from streaming/non-streaming responses, auto-backfill in subsequent tool call requests
+- Upstream mapping auto-recovery: restore lost upstream mappings from `.bak` backup, extension storage, and local history
+- `copilotRetryProxy.openConfig` command: open the upstream config file in the editor
 
 ### Changed
-- 改进了流首帧嗅探逻辑，细化可重试错误的判定条件
-- HTTP 连接池管理，提升代理转发性能
-- 上游映射落盘使用原子写入（临时文件 + rename），防止断电损坏
-- 改写 `chatLanguageModels.json` 前强制确保上游映射已安全落盘
+- Improved first-frame sniffing logic for streaming, refined retryable error conditions
+- HTTP connection pool management, improved proxy forwarding performance
+- Upstream mapping disk persistence uses atomic writes (temp file + rename) to prevent corruption on power loss
+- Force-ensure upstream mapping is safely persisted before rewriting `chatLanguageModels.json`
 
 ### Fixed
-- 修正未注册 `openConfig` 命令的问题
+- Fixed unregistered `openConfig` command
 
 ## [0.0.4] - 2026-07-10
 
 ### Added
-- 指数退避 + 抖动重试策略，尊重 `retry-after` / `retry-after-ms` 头
-- 流式响应首帧错误嗅探，流开始后不中途重连
-- 状态栏可视化 ON/OFF，配置变更自动重启
-- 自动探测多平台 `chatLanguageModels.json` 路径
+- Exponential backoff + jitter retry strategy, respecting `retry-after` / `retry-after-ms` headers
+- Streaming response first-frame error sniffing; no mid-stream reconnection once stream has started
+- Status bar ON/OFF visualization, auto-restart on config change
+- Auto-detect `chatLanguageModels.json` path across multiple platforms
 
 ### Changed
-- 改写 `chatLanguageModels.json` 前创建 `.bak` 备份
+- Create `.bak` backup before rewriting `chatLanguageModels.json`
 
 ## [0.0.3] - 2026-07-08
 
 ### Added
-- 支持 Windows / macOS / Linux 三平台自动路径探测
-- 命令面板集成：启动/停止/重启/查看状态/查看日志
+- Support auto path detection for Windows / macOS / Linux
+- Command palette integration: start/stop/restart/show status/show log
 
 ## [0.0.2] - 2026-07-05
 
 ### Added
-- 本地 HTTP 代理，按路径前缀转发到真实上游
-- 自动改写 `chatLanguageModels.json` 劫持第三方模型流量
-- 429 / 5xx / 11210 错误自动重试
+- Local HTTP proxy, forwarding to real upstream by path prefix
+- Auto-rewrite `chatLanguageModels.json` to hijack third-party model traffic
+- Auto-retry on 429 / 5xx / 11210 errors
 
 ## [0.0.1] - 2026-07-01
 
-- 初始版本
+- Initial release
